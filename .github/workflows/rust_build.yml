@@ -10,8 +10,12 @@ jobs:
 
     steps:
     - uses: actions/checkout@v2
+    - name: Install a modern Rust toolchain (only to build the cargo-skyline tool itself)
+      run: rustup toolchain install stable
     - name: Install cargo-skyline
       run: cargo install --git https://github.com/jam1garner/cargo-skyline
+      env:
+        RUSTUP_TOOLCHAIN: stable
     - name: Install rust-std-skyline-squashed
       run: cd .. && git clone https://github.com/jam1garner/rust-std-skyline-squashed && cd -
     - name: Attempt to build
@@ -21,4 +25,3 @@ jobs:
       with:
         name: libarc_randomizer_folder
         path: target/aarch64-skyline-switch/release/libarc_randomizer_folder.nro
-
