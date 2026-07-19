@@ -21,3 +21,4 @@ jobs:
       with:
         name: libarc_randomizer_folder
         path: target/aarch64-skyline-switch/release/libarc_randomizer_folder.nro
+
