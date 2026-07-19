@@ -1,24 +1,92 @@
 #![feature(proc_macro_hygiene)]
 
-
 #[macro_use]
 extern crate lazy_static;
 
-use std::{fs, io::{Error, ErrorKind, Result}, path::{Path, PathBuf}, collections::HashMap, sync::Mutex};
-use rand::Rng;
-use walkdir::WalkDir;
 use arcropolis_api::*;
+use rand::Rng;
+use std::{
+    collections::HashMap,
+    fs,
+    io::{Error, ErrorKind, Result},
+    path::{Path, PathBuf},
+    sync::Mutex,
+};
+use walkdir::WalkDir;
 
-const RANDOMIZE_PATH: &str = "rom:/Randomizer/";
+const RANDOMIZE_PATH: &str = "sd:/ultimate/Randomizer/";
 
-lazy_static! {
-    static ref FILE_HOLDER: Mutex<HashMap<u64, PathBuf>> = {
-        let m = HashMap::new();
-        Mutex::new(m)
-    };    
+enum CallbackType {
+    Arc,
+    Stream,
 }
 
-pub fn random_file_select(directory: &Path) -> Result<String>{
+struct Callback {
+    callback_type: CallbackType,
+    size: usize,
+}
+
+lazy_static! {
+    static ref CALLBACKS: Mutex<HashMap<u64, Callback>> = {
+        let m = HashMap::new();
+        Mutex::new(m)
+    };
+    static ref PARENT_FOLDER: Mutex<HashMap<u64, String>> = {
+        let m = HashMap::new();
+        Mutex::new(m)
+    };
+    static ref USE_FOLDER_FROM_PARENT: Mutex<HashMap<String, String>> = {
+        let m = HashMap::new();
+        Mutex::new(m)
+    };
+    static ref HASH_TO_ARC_PATH: Mutex<HashMap<u64, String>> = {
+        let m = HashMap::new();
+        Mutex::new(m)
+    };
+    static ref HASH_TO_ACTUAL_PATH: Mutex<HashMap<u64, String>> = {
+        let m = HashMap::new();
+        Mutex::new(m)
+    };
+}
+
+pub fn pick_random_folder_for_parent(parent_path: String) {
+    let mut rng = rand::thread_rng();
+
+    let folders: Vec<String> = std::fs::read_dir(&parent_path)
+        .unwrap()
+        .enumerate()
+        .filter_map(|(_i, folder)| {
+            let folder = folder.unwrap().path();
+
+            if !folder.is_dir() {
+                return None;
+            }
+
+            let name = folder
+                .file_name()
+                .unwrap()
+                .to_os_string()
+                .into_string()
+                .unwrap();
+            Some(name)
+        })
+        .collect();
+
+    let count = folders.len();
+
+    if count <= 0 {
+        println!("No folders found under {}", parent_path);
+        return;
+    }
+
+    let random_result = rng.gen_range(0..count);
+    USE_FOLDER_FROM_PARENT
+        .lock()
+        .unwrap()
+        .insert(parent_path, folders[random_result].clone());
+}
+
+pub fn random_file_select(directory: &Path) -> Result<String> {
     let mut rng = rand::thread_rng();
 
     let mut files = HashMap::new();
@@ -34,38 +102,96 @@ pub fn random_file_select(directory: &Path) -> Result<String>{
     let count = files.len();
 
     if count <= 0 {
-        return Err(Error::new(ErrorKind::Other, "No Files Found!"))
+        return Err(Error::new(ErrorKind::Other, "No Files Found!"));
     }
-    
+
     let random_result = rng.gen_range(0..count);
 
     Ok(files.get(&random_result).unwrap().to_string())
 }
 
-#[arc_callback]
-fn arc_file_callback(hash: u64, data: &mut [u8]) -> Option<usize>{
-    match random_file_select(FILE_HOLDER.lock().unwrap().get(&hash).unwrap()){
-        Ok(s) => {
-            let file = fs::read(s).unwrap();
-            
-            // Shoutouts to Genwald
-            data[..file.len()].copy_from_slice(&file);
+fn get_path_from_hash(hash: &u64) -> PathBuf {
+    let mut path = PathBuf::new();
+    let parent_folder = PARENT_FOLDER.lock().unwrap().get(&hash).unwrap().clone();
+    path.push(&parent_folder);
+    path.push(USE_FOLDER_FROM_PARENT.lock().unwrap().get(&parent_folder).unwrap());
+    path.push(HASH_TO_ACTUAL_PATH.lock().unwrap().get(&hash).unwrap());
+    path
+}
 
-            Some(file.len())
-        },
-        Err(_err) => None
+#[arc_callback]
+fn randomize_folders(_hash: u64, _data: &mut [u8]) -> Option<usize> {
+    std::fs::read_dir(&RANDOMIZE_PATH).unwrap().enumerate().for_each(|(_i, outer_path)| {
+        let outer_path = outer_path.unwrap().path();
+        if outer_path.is_dir(){
+            pick_random_folder_for_parent(format!("{}", outer_path.display()));
+        }
+    });
+    None
+}
+
+#[arc_callback]
+fn arc_file_callback(hash: u64, data: &mut [u8]) -> Option<usize> {
+    let path = get_path_from_hash(&hash);
+    println!("ARC Path: {}\n\nPath: {}", HASH_TO_ARC_PATH.lock().unwrap().get(&hash).unwrap(), path.display());
+    let res = {
+        if path.is_dir() {
+            random_file_select(&path)
+        } else {
+            Ok(format!("{}", path.display()))
+        }
+    };
+
+    match res {
+        Ok(s) => {
+            let s = {
+                if Path::new(&s).exists() {
+                    s
+                } else {
+                    format!("arc:/{}", HASH_TO_ARC_PATH.lock().unwrap().get(&hash).unwrap())
+                }
+            };
+            match fs::read(s) {
+                Ok(file) => {
+                    // Shoutouts to Genwald
+                    data[..file.len()].copy_from_slice(&file);
+
+                    Some(file.len())
+                },
+                Err(_err) => {
+                    None
+                }
+            }
+    
+        }
+        Err(_err) => None,
     }
 }
 
 #[stream_callback]
-fn stream_file_callback(hash: u64) -> Option<String>{    
-    match random_file_select(FILE_HOLDER.lock().unwrap().get(&hash).unwrap()){
-        Ok(s) => Some(s),
-        Err(_err) => None
+fn stream_file_callback(hash: u64) -> Option<String> {
+    let path = get_path_from_hash(&hash);
+    let res = {
+        if path.is_dir() {
+            random_file_select(&path)
+        } else {
+            Ok(format!("{}", path.display()))
+        }
+    };
+
+    match res {
+        Ok(s) => {
+            if Path::new(&s).exists() {
+                Some(s)
+            } else {
+                None
+            }
+        },
+        Err(_err) => None,
     }
 }
 
-fn get_biggest_size_from_path(path: &Path) -> usize{
+fn get_biggest_size_from_path(path: &Path) -> usize {
     let mut biggest_size: usize = 0;
 
     for entry in fs::read_dir(path).unwrap() {
@@ -73,34 +199,174 @@ fn get_biggest_size_from_path(path: &Path) -> usize{
         if size > biggest_size {
             biggest_size = size;
         }
-    };
+    }
 
     biggest_size
 }
 
-#[skyline::main(name = "arc-randomizer")]
+#[skyline::main(name = "arc-randomizer-folder")]
 pub fn main() {
-    if !Path::new(RANDOMIZE_PATH).exists(){
+    if !Path::new(RANDOMIZE_PATH).exists() {
         return;
     }
 
-    for entry in WalkDir::new(&RANDOMIZE_PATH) {
-        let entry = entry.unwrap();
+    std::fs::read_dir(&RANDOMIZE_PATH)
+        .unwrap()
+        .enumerate()
+        .for_each(|(_i, outer_path)| {
+            let outer_path = outer_path.unwrap().path();
+            std::fs::read_dir(&outer_path)
+                .unwrap()
+                .enumerate()
+                .for_each(|(_y, inner_path)| {
+                    let inner_path = inner_path.unwrap().path();
+                    let inner_path_str = format!("{}", &inner_path.display());
+                    for entry in WalkDir::new(&inner_path) {
+                        let entry = entry.unwrap();
+                        let entry_str = format!("{}", &entry.path().display());
+                        
+                        if inner_path_str.len() == entry_str.len(){
+                            continue
+                        }
 
-        if entry.path().is_dir() && format!("{}", &entry.path().display()).contains("."){
+                        let arc_path = format!("{}", entry_str)
+                            [inner_path_str.len() + 1..]
+                            .replace(";", ":")
+                            .replace(".mp4", ".webm")
+                            .to_lowercase();
 
-            let path = &format!("{}", &entry.path().display())[RANDOMIZE_PATH.len()..].replace(";", ":").replace(".mp4", ".webm");
-            
-            let hash = hash40(path);
-            
-            FILE_HOLDER.lock().unwrap().insert(hash.as_u64(), entry.path().to_path_buf());
-            
-            if path.contains("stream"){
-                stream_file_callback::install(hash);
-            }else{
-                arc_file_callback::install(hash, get_biggest_size_from_path(&entry.path()));
-            }
+                        let actual_path = &format!("{}", entry_str)
+                            [inner_path_str.len() + 1..];
+                        
+                        if arc_path.contains(".") {
+                            // File or Folder found
+                            let hash = hash40(&arc_path).as_u64();
 
+                            let callback: Callback = Callback {
+                                size: {
+                                    if entry.path().is_dir() {
+                                        get_biggest_size_from_path(&entry.path())
+                                    } else {
+                                        entry.metadata().unwrap().len() as usize
+                                    }
+                                },
+                                callback_type: {
+                                    if arc_path.contains("stream") {
+                                        CallbackType::Stream
+                                    } else {
+                                        CallbackType::Arc
+                                    }
+                                },
+                            };
+
+                            if CALLBACKS.lock().unwrap().contains_key(&hash) {
+                                if CALLBACKS.lock().unwrap().get(&hash).unwrap().size
+                                    < callback.size
+                                {
+                                    *CALLBACKS.lock().unwrap().get_mut(&hash).unwrap() = callback;
+                                }
+                            } else {
+                                CALLBACKS.lock().unwrap().insert(hash, callback);
+                            }
+
+                            PARENT_FOLDER
+                                .lock()
+                                .unwrap()
+                                .insert(hash, format!("{}", outer_path.display()));
+                            HASH_TO_ARC_PATH
+                                .lock()
+                                .unwrap()
+                                .insert(hash, arc_path.to_string());
+                            HASH_TO_ACTUAL_PATH
+                                .lock()
+                                .unwrap()
+                                .insert(hash, actual_path.to_string());
+                        }
+                    }
+                });
+        });
+
+    for (key, value) in &*CALLBACKS.lock().unwrap() {
+        match value.callback_type {
+            CallbackType::Arc => arc_file_callback::install(*key, value.size),
+            CallbackType::Stream => stream_file_callback::install(*key),
         }
     }
+
+    std::fs::read_dir(&RANDOMIZE_PATH).unwrap().enumerate().for_each(|(_i, outer_path)| {
+        let outer_path = outer_path.unwrap().path();
+        if outer_path.is_dir(){
+            pick_random_folder_for_parent(format!("{}", outer_path.display()));
+        }
+    });
+    randomize_folders::install(
+        Hash40::from("stage/resultstage/normal/motion/resultstage_set/resultstage_set_00.nuanmb"),
+        0,
+    );
+
+    // --- Parche: re-sortea también cuando Jack carga su propia animacion de victoria ---
+    randomize_folders::install(
+        Hash40::from("fighter/jack/motion/mona/c00/j02win1.nuanmb"),
+        0,
+    );
+    randomize_folders::install(
+        Hash40::from("fighter/jack/motion/mona/c00/j02win3.nuanmb"),
+        0,
+    );
+    randomize_folders::install(
+        Hash40::from("fighter/jack/motion/mona/c01/j02win1.nuanmb"),
+        0,
+    );
+    randomize_folders::install(
+        Hash40::from("fighter/jack/motion/mona/c01/j02win3.nuanmb"),
+        0,
+    );
+    randomize_folders::install(
+        Hash40::from("fighter/jack/motion/mona/c02/j02win1.nuanmb"),
+        0,
+    );
+    randomize_folders::install(
+        Hash40::from("fighter/jack/motion/mona/c02/j02win3.nuanmb"),
+        0,
+    );
+    randomize_folders::install(
+        Hash40::from("fighter/jack/motion/mona/c03/j02win1.nuanmb"),
+        0,
+    );
+    randomize_folders::install(
+        Hash40::from("fighter/jack/motion/mona/c03/j02win3.nuanmb"),
+        0,
+    );
+    randomize_folders::install(
+        Hash40::from("fighter/jack/motion/mona/c04/j02win1.nuanmb"),
+        0,
+    );
+    randomize_folders::install(
+        Hash40::from("fighter/jack/motion/mona/c04/j02win3.nuanmb"),
+        0,
+    );
+    randomize_folders::install(
+        Hash40::from("fighter/jack/motion/mona/c05/j02win1.nuanmb"),
+        0,
+    );
+    randomize_folders::install(
+        Hash40::from("fighter/jack/motion/mona/c05/j02win3.nuanmb"),
+        0,
+    );
+    randomize_folders::install(
+        Hash40::from("fighter/jack/motion/mona/c06/j02win1.nuanmb"),
+        0,
+    );
+    randomize_folders::install(
+        Hash40::from("fighter/jack/motion/mona/c06/j02win3.nuanmb"),
+        0,
+    );
+    randomize_folders::install(
+        Hash40::from("fighter/jack/motion/mona/c07/j02win1.nuanmb"),
+        0,
+    );
+    randomize_folders::install(
+        Hash40::from("fighter/jack/motion/mona/c07/j02win3.nuanmb"),
+        0,
+    );
 }
